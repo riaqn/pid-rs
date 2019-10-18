@@ -1,116 +1,137 @@
 //! A proportional-integral-derivative (PID) controller.
 #![no_std]
 extern crate num_traits;
-use num_traits::float::FloatCore;
+use num_traits::{Bounded, Signed, Zero};
+
+use core::ops::{Add, Mul, Sub};
+
+pub trait State: Sub<Self, Output = Self> + Copy {}
+pub trait Control: Bounded + Zero + Signed + Add + PartialOrd + Copy {}
+pub trait Gain<S, C>: Copy + Mul<S, Output = C> {}
 
 #[derive(Debug)]
-pub struct Pid<T: FloatCore> {
+pub struct Pid<S, C, G>
+where
+    S: State,
+    C: Control,
+    G: Gain<S, C>,
+{
     /// Proportional gain.
-    pub kp: T,
+    pub kp: G,
     /// Integral gain.
-    pub ki: T,
+    pub ki: G,
     /// Derivative gain.
-    pub kd: T,
+    pub kd: G,
     /// Limit of contribution of P term: `(-p_limit <= P <= p_limit)`
-    pub p_limit: T,
+    pub p_limit: C,
     /// Limit of contribution of I term `(-i_limit <= I <= i_limit)`
-    pub i_limit: T,
+    pub i_limit: C,
     /// Limit of contribution of D term `(-d_limit <= D <= d_limit)`
-    pub d_limit: T,
+    pub d_limit: C,
     /// Limit of the sum of PID terms `(-limit <= P + I + D <+ limit)`
-    pub limit: T,
+    pub limit: C,
 
-    pub setpoint: T,
-    prev_measurement: Option<T>,
+    pub setpoint: S,
+    prev_measurement: Option<S>,
     /// `integral_term = sum[error(t) * ki(t)] (for all t)`
-    integral_term: T,
+    integral_term: C,
 }
 
 #[derive(Debug)]
-pub struct ControlOutput<T: FloatCore> {
+pub struct ControlOutput<C> {
     /// Contribution of the P term to the output.
-    pub p: T,
+    pub p: C,
     /// Contribution of the I term to the output.
     /// `i = sum[error(t) * ki(t)] (for all t)`
-    pub i: T,
+    pub i: C,
     /// Contribution of the D term to the output.
-    pub d: T,
+    pub d: C,
     /// Output of the PID controller.
-    pub output: T,
+    pub output: C,
 }
 
-impl<T> Pid<T>
+impl<S, C, G> Pid<S, C, G>
 where
-    T: FloatCore,
+    S: State,
+    C: Control,
+    G: Gain<S, C>,
 {
-    pub fn new(kp: T, ki: T, kd: T, setpoint: T) -> Self {
-        let inf = T::infinity();
+    pub fn new(kp: G, ki: G, kd: G, setpoint: S) -> Self {
+        let max = C::max_value();
         Self {
             kp,
             ki,
             kd,
-            p_limit: inf,
-            i_limit: inf,
-            d_limit: inf,
-            limit: inf,
+            p_limit: max,
+            i_limit: max,
+            d_limit: max,
+            limit: max,
             setpoint,
             prev_measurement: None,
-            integral_term: T::zero(),
+            integral_term: C::zero(),
         }
     }
 
     /// Resets the integral term back to zero. This may drastically change the
     /// control output.
     pub fn reset_integral_term(&mut self) {
-        self.integral_term = T::zero();
+        self.integral_term = C::zero();
+    }
+
+    fn bound(v: C, b: C) -> C {
+        return (if v.abs() < b { v.abs() } else { b }) * v.signum();
     }
 
     /// Given a new measurement, calculates the next control output.
-    pub fn next_control_output(&mut self, measurement: T) -> ControlOutput<T> {
+    pub fn next_control_output(&mut self, measurement: S) -> ControlOutput<C> {
         let error = self.setpoint - measurement;
 
-        let p_unbounded = error * self.kp;
-        let p = self.p_limit.min(p_unbounded.abs()) * p_unbounded.signum();
+        let p = Self::bound(self.kp * error, self.p_limit);
 
         // Mitigate output jumps when ki(t) != ki(t-1).
         // While it's standard to use an error_integral that's a running sum of
         // just the error (no ki), because we support ki changing dynamically,
         // we store the entire term so that we don't need to remember previous
         // ki values.
-        self.integral_term = self.integral_term + error * self.ki;
         // Mitigate integral windup: Don't want to keep building up error
         // beyond what i_limit will allow.
-        self.integral_term =
-            self.i_limit.min(self.integral_term.abs()) * self.integral_term.signum();
+        self.integral_term = Self::bound(self.integral_term + self.ki * error, self.i_limit);
 
         // Mitigate derivative kick: Use the derivative of the measurement
         // rather than the derivative of the error.
-        let d_unbounded = -match self.prev_measurement.as_ref() {
-            Some(prev_measurement) => measurement - *prev_measurement,
-            None => T::zero(),
-        } * self.kd;
+        let d = match self.prev_measurement.as_ref() {
+            Some(prev_measurement) => {
+                Self::bound(self.kd * (*prev_measurement - measurement), self.d_limit)
+            }
+            None => C::zero(),
+        };
         self.prev_measurement = Some(measurement);
-        let d = self.d_limit.min(d_unbounded.abs()) * d_unbounded.signum();
 
-        let output_unbounded = p + self.integral_term + d;
-        let output = self.limit.min(output_unbounded.abs()) * output_unbounded.signum();
+        let output = Self::bound(p + self.integral_term + d, self.limit);
 
         ControlOutput {
             p,
             i: self.integral_term,
             d,
-            output: output,
+            output,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Pid;
+    use super::*;
+    impl Gain<f32, f32> for f32 {}
+    impl State for f32 {}
+    impl Control for f32 {}
+
+    impl Gain<f64, f64> for f64 {}
+    impl State for f64 {}
+    impl Control for f64 {}
 
     #[test]
     fn proportional() {
-        let mut pid = Pid::new(2.0, 0.0, 0.0, 10.0);
+        let mut pid: Pid<f32, f32, f32> = Pid::new(2.0, 0.0, 0.0, 10.0);
         assert_eq!(pid.setpoint, 10.0);
 
         // Test simple proportional
@@ -123,7 +144,7 @@ mod tests {
 
     #[test]
     fn derivative() {
-        let mut pid = Pid::new(0.0, 0.0, 2.0, 10.0);
+        let mut pid: Pid<f32, f32, f32> = Pid::new(0.0, 0.0, 2.0, 10.0);
 
         // Test that there's no derivative since it's the first measurement
         assert_eq!(pid.next_control_output(0.0).output, 0.0);
@@ -195,7 +216,7 @@ mod tests {
     fn f32_and_f64() {
         let mut pid32 = Pid::new(2.0f32, 0.0, 0.0, 10.0);
 
-        let mut pid64 = Pid::new(2.0f64, 0.0, 0.0, 10.0);
+        let mut pid64: Pid<f64, f64, f64> = Pid::new(2.0f64, 0.0, 0.0, 10.0);
 
         assert_eq!(
             pid32.next_control_output(0.0).output,
